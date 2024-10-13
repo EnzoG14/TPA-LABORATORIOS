@@ -1,130 +1,120 @@
 import time
-import board
-import digitalio
-import os
-import pwmio
-
-import wifi
-import ssl
-import socketpool
-import adafruit_requests
-import asyncio
-
-def wifi_connection(ssid , password):
-    
-    print("Conectando a Wi-Fi...")
-    try:
-        wifi.radio.connect(ssid, password)
-        print(f"Conectado a {ssid}")
-        print(f"IP asignada: {wifi.radio.ipv4_address}")
-    except Exception as e:
-        print(f"Error al conectar: {e}")
+from machine import Pin, PWM
+import uasyncio as asyncio
+import micro_monitoring  # Reemplazar por circuit_monitoring si usas CircuitPython
 
 
 class Personas(object):
+    _instance = None  # Atributo de clase que almacena la única instancia
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            # Si no existe instancia, la creamos
+            cls._instance = super(Personas, cls).__new__(cls)
+        return cls._instance
 
     def __init__(self, cantidad, aforo, tiempo_prom_espera):
-        self.cantidad = cantidad
-        self.tiempo_espera = 0
-        self.aforo = aforo
-        # tiempo de espera promedio por persona en segundos
-        self.tiempo_prom_espera = 50
+        if not hasattr(self, '_initialized'):  # Evitar inicialización repetida
+            self.cantidad = cantidad
+            self.tiempo_espera = 0
+            self.aforo = aforo
+            self.tiempo_prom_espera = tiempo_prom_espera
+            self.ultima_activacion = 0
+            self._initialized = True  # Marca la instancia como inicializada
+
+    def get_app_data(self):
+        return {
+            "tiempo_espera": self.tiempo_espera,
+            "cantidad": self.cantidad
+        }
+
+    def __call__(self):
+        # Al ser llamada, devuelve la misma instancia
+        return self
 
 
 
-async def request_post(requests, url ,personas):
-    try:
-        response = await requests.post(url, json={"cant_personas": personas.cantidad, "tiempo_espera":personas.tiempo_espera})
-        print(f"Código de estado: {response.status_code}")
-        print(f"Respuesta del servidor: {response.text}")
-    except Exception as e:
-        print(f"Error en la petición POST: {e}")
+def sensor_callback(pin, personas, buzzer):
+    tiempo_actual = time.ticks_ms()
+    tiempo_debouncing = 1500
+
+    if time.ticks_diff(tiempo_actual, personas.ultima_activacion) > tiempo_debouncing:
+        personas.ultima_activacion = tiempo_actual
+        personas.cantidad += 1
+        personas.tiempo_espera += personas.tiempo_prom_espera
+        print(f"Gente! - Sensor activado, cantidad personas: {personas.cantidad}, tiempo de espera: {personas.tiempo_espera}")
+        asyncio.create_task(manejar_buzzer(buzzer, personas))
 
 
-async def manejar_movimiento(pin, buzzer, personas, requests, url):
-    sensor = digitalio.DigitalInOut(pin)
-    sensor.direction = digitalio.Direction.INPUT
+async def monitor_tiempo_espera(pin, buzzer, personas):
+    led = PWM(Pin(pin))
+    led.freq(1000)
 
     while True:
-        if not sensor.value:
-            personas.cantidad += 1
-            personas.tiempo_espera += personas.tiempo_prom_espera
-            print(f"Gente! - Sensor: {sensor.value}, cantidad personar: {personas.cantidad}, tiempo de espera: {personas.tiempo_espera}")
-            print("--------------")
-            await manejar_buzzer(buzzer, personas)
-            await request_post(requests, url, personas)
-
-        await asyncio.sleep(0.2)
-
-
-async def monitor_tiempo_espera(pin, buzzer, requests, url, personas):
-
-    led = pwmio.PWMOut(pin, frequency=1000)
-
-    while True:
-        print(f"Cantidad de personas:{personas.cantidad}, tiempo de espera:{personas.tiempo_espera}")
         if personas.tiempo_espera > 0:
             personas.tiempo_espera -= 1
         else:
             personas.tiempo_espera = 0
-        if (personas.cantidad-1) * personas.tiempo_prom_espera >= personas.tiempo_espera:
-            personas.cantidad-=1
+
+        if (personas.cantidad - 1) * personas.tiempo_prom_espera >= personas.tiempo_espera:
+            personas.cantidad -= 1
+            print(f"¡Alguien se ha ido! Cantidad de personas: {personas.cantidad}, tiempo de espera: {personas.tiempo_espera}")
             await manejar_buzzer(buzzer, personas)
-            await request_post(requests, url, personas)
-        led.duty_cycle = int(65535 * personas.tiempo_espera / (personas.aforo * personas.tiempo_prom_espera))
+
+        duty_cycle = int(65535 * personas.tiempo_espera / (personas.aforo * personas.tiempo_prom_espera))
+        led.duty_u16(duty_cycle)
 
         await asyncio.sleep(1)
 
 
 async def manejar_buzzer(buzzer, personas):
     ocupacion = (personas.cantidad / personas.aforo) * 100
-    # Sonidos según el porcentaje de ocupación
+    beep_count = 0
+    beep_delay = 0.5
+
     if ocupacion >= 100:
-
-        for _ in range(10):
-            buzzer.value = True
-            await asyncio.sleep(0.1)
-            buzzer.value = False
-            await asyncio.sleep(0.1)
+        beep_count, beep_delay = 10, 0.1
     elif ocupacion >= 75:
-
-        for _ in range(7):
-            buzzer.value = True
-            await asyncio.sleep(0.2)
-            buzzer.value = False
-            await asyncio.sleep(0.2)
+        beep_count, beep_delay = 7, 0.2
     elif ocupacion >= 50:
-
-        for _ in range(5):
-            buzzer.value = True
-            await asyncio.sleep(0.3)
-            buzzer.value = False
-            await asyncio.sleep(0.3)
+        beep_count, beep_delay = 5, 0.3
     elif ocupacion >= 25:
+        beep_count, beep_delay = 3, 0.4
 
-        for _ in range(3):
-            buzzer.value = True
-            await asyncio.sleep(0.4)
-            buzzer.value = False
-            await asyncio.sleep(0.4)
-    await asyncio.sleep(3)
+    for _ in range(beep_count):
+        buzzer.value(1)
+        await asyncio.sleep(beep_delay)
+        buzzer.value(0)
+        await asyncio.sleep(beep_delay)
+
+
+async def operations():
+    # Configuración del sensor de movimiento y buzzer
+    personas = Personas(0, 10, 50)
+
+    buzzer = Pin(18, Pin.OUT)
+    buzzer.value(0)
+
+    sensor_pin = Pin(15, Pin.IN)
+    sensor_pin.irq(trigger=Pin.IRQ_FALLING, handler=lambda pin: sensor_callback(pin, personas, buzzer))
+
+    # Monitoreo del tiempo de espera (LED PWM)
+    await asyncio.create_task(monitor_tiempo_espera(0, buzzer, personas))
+
+
+def get_app_data():
+    # Función que devuelve un dict con la data para el maestro
+    personas = Personas(0, 10, 50)  # Aquí deberías usar la instancia real de `personas`
+    return personas.get_app_data()
 
 
 async def main():
-    wifi_connection(os.getenv("CIRCUITPY_WIFI_SSID"),os.getenv("CIRCUITPY_WIFI_PASSWORD"))
-    personas = Personas(0, 10, 50)
-
-    pool = socketpool.SocketPool(wifi.radio)
-    requests = adafruit_requests.Session(pool, ssl.create_default_context())
-    url = "http://192.168.0.131:8000/sensor"
-    
-    buzzer = digitalio.DigitalInOut(board.GP18)
-    buzzer.direction = digitalio.Direction.OUTPUT
-    buzzer.value = False
-    
-    sensor_task = asyncio.create_task(manejar_movimiento(board.GP15, buzzer, personas, requests, url))
-    waiting_task = asyncio.create_task(monitor_tiempo_espera(board.GP0, buzzer, requests, url, personas))
-
-    await asyncio.gather(sensor_task, waiting_task)
+    # Funcionamiento del equipo y monitoreo con el maestro se ejecutan concurrentemente.
+    await asyncio.gather(
+        operations(),
+        micro_monitoring.monitoring(get_app_data)  # Monitoreo del maestro
+    )
 
 asyncio.run(main())
+
+
